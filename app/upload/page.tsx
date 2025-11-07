@@ -1,6 +1,8 @@
 "use client";
 
 import { useRef, useState } from "react";
+import { AssetInfoDto, AssetKind } from "@/lib/asset-types";
+import { getImageMetadata, getVideoMetadata } from "@/lib/media-utils";
 
 const MAX_IMAGES = Number(process.env.NEXT_PUBLIC_UPLOAD_MAX_IMAGES ?? 10);
 const MAX_VIDEOS = Number(process.env.NEXT_PUBLIC_UPLOAD_MAX_VIDEOS ?? 3);
@@ -8,31 +10,15 @@ const MAX_IMAGE_BYTES = (Number(process.env.NEXT_PUBLIC_UPLOAD_MAX_IMAGE_MB ?? 5
 const MAX_VIDEO_BYTES = (Number(process.env.NEXT_PUBLIC_UPLOAD_MAX_VIDEO_MB ?? 1024)) * 1024 * 1024;
 const MAX_VIDEO_SECONDS = Number(process.env.NEXT_PUBLIC_UPLOAD_MAX_VIDEO_SECONDS ?? 600);
 
-// 비디오 메타(길이) 읽기
-async function getVideoDurationSeconds(file: File): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
-    const video = document.createElement("video");
-    video.preload = "metadata";
-    video.onloadedmetadata = () => {
-      const sec = video.duration;
-      URL.revokeObjectURL(url);
-      resolve(sec);
-    };
-    video.onerror = (e) => {
-      URL.revokeObjectURL(url);
-      reject(new Error("동영상 메타 정보를 읽을 수 없습니다."));
-    };
-    video.src = url;
-  });
-}
-
 // 이미지 단일 PUT 업로드 (progress 지원: XMLHttpRequest)
 async function uploadImageWithProgress(
   file: File,
   extraPath?: string,
   onProgress?: (p: number) => void
-): Promise<string> {
+): Promise<AssetInfoDto> {
+  // 이미지 메타데이터 추출
+  const metadata = await getImageMetadata(file);
+
   // 서버에서 URL/Key 받기
   const pres = await fetch("/api/upload/image", {
     method: "POST",
@@ -61,16 +47,28 @@ async function uploadImageWithProgress(
     xhr.send(file);
   });
 
-  return storageKey; // S3 key 반환
+  // AssetInfoDto 형식으로 반환
+  return {
+    storageKey,
+    mimeType: file.type,
+    bytes: file.size,
+    kind: AssetKind.IMAGE,
+    meta: {
+      width: metadata.width,
+      height: metadata.height,
+    },
+  };
 }
 
 // 동영상 멀티파트 업로드 (간단 진행률: 파트 완료 기준)
 async function uploadVideoMultipart(
   file: File,
-  durationSeconds: number,
   extraPath?: string,
   onProgress?: (p: number) => void
-): Promise<string> {
+): Promise<AssetInfoDto> {
+  // 비디오 메타데이터 추출
+  const metadata = await getVideoMetadata(file);
+
   // 1) 세션 시작
   const startRes = await fetch("/api/upload/video/start", {
     method: "POST",
@@ -78,7 +76,7 @@ async function uploadVideoMultipart(
       filename: file.name,
       contentType: file.type,
       fileSize: file.size,
-      durationSeconds,
+      durationSeconds: metadata.duration,
       extraPath, // 선택적: 'profile', 'company-a', 'users/john' 등
     }),
   });
@@ -126,7 +124,19 @@ async function uploadVideoMultipart(
   if (!completeRes.ok) throw new Error("동영상 업로드 완료 실패");
 
   const { storageKey } = await completeRes.json();
-  return storageKey;
+
+  // AssetInfoDto 형식으로 반환
+  return {
+    storageKey,
+    mimeType: file.type,
+    bytes: file.size,
+    kind: AssetKind.VIDEO,
+    meta: {
+      width: metadata.width,
+      height: metadata.height,
+      duration: metadata.duration,
+    },
+  };
 }
 
 export default function UploadPage() {
@@ -200,7 +210,7 @@ export default function UploadPage() {
 
     try {
       // 1) 이미지 업로드(병렬) - Promise.all로 순서 보장하면서 동시 업로드
-      const imageKeys: string[] = await Promise.all(
+      const imageAssets: AssetInfoDto[] = await Promise.all(
         imageFiles.map((file, i) =>
           uploadImageWithProgress(
             file,
@@ -217,23 +227,23 @@ export default function UploadPage() {
       );
 
       // 이미지 업로드 완료 로그
-      if (imageKeys.length > 0) {
+      if (imageAssets.length > 0) {
         console.log("✅ 이미지 업로드 완료:");
-        imageKeys.forEach((key, i) => {
-          console.log(`  [${i}] ${imageFiles[i].name} → ${key}`);
+        imageAssets.forEach((asset, i) => {
+          console.log(`  [${i}] ${imageFiles[i].name} → ${asset.storageKey} (${asset.meta?.width}x${asset.meta?.height})`);
         });
       }
 
       // 2) 동영상 업로드(병렬) - Promise.all로 순서 보장하면서 동시 업로드
-      const videoKeys: string[] = await Promise.all(
+      const videoAssets: AssetInfoDto[] = await Promise.all(
         videoFiles.map(async (file, i) => {
-          const duration = await getVideoDurationSeconds(file);
-          if (duration > MAX_VIDEO_SECONDS) {
+          // 메타데이터는 uploadVideoMultipart 내부에서 추출되므로 여기서 validation만 수행
+          const metadata = await getVideoMetadata(file);
+          if (metadata.duration > MAX_VIDEO_SECONDS) {
             throw new Error(`동영상 길이(10분) 초과: ${file.name}`);
           }
           return uploadVideoMultipart(
             file,
-            duration,
             extraPath || undefined,
             (p: number) => {
               setVideoProgress((prev) => {
@@ -247,26 +257,17 @@ export default function UploadPage() {
       );
 
       // 동영상 업로드 완료 로그
-      if (videoKeys.length > 0) {
+      if (videoAssets.length > 0) {
         console.log("✅ 동영상 업로드 완료:");
-        videoKeys.forEach((key, i) => {
-          console.log(`  [${i}] ${videoFiles[i].name} → ${key}`);
+        videoAssets.forEach((asset, i) => {
+          console.log(`  [${i}] ${videoFiles[i].name} → ${asset.storageKey} (${asset.meta?.duration}초)`);
         });
       }
 
-      // 3) 최종 폼 제출 (이름 + 업로드된 S3 key 목록 + 원본 파일명)
+      // 3) 최종 폼 제출 - AssetInfoDto 배열로 전송
       const submitData = {
         name,
-        images: imageKeys.map((key, i) => ({
-          key,
-          originalFilename: imageFiles[i].name,
-          order: i,
-        })),
-        videos: videoKeys.map((key, i) => ({
-          key,
-          originalFilename: videoFiles[i].name,
-          order: i,
-        })),
+        assets: [...imageAssets, ...videoAssets],
       };
 
       console.log("📤 최종 제출 데이터:");
